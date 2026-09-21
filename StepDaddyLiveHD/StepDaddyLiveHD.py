@@ -78,3 +78,4 @@ app = rx.App(
 )
 
 app.register_lifespan_task(backend.update_channels)
+app.register_lifespan_task(backend.update_epg)

@@ -74,6 +74,7 @@ docker run -p 3535:3535 step-daddy-live-hd
 - **SOCKS5**: Proxy DLHD traffic through a SOCKS5 server if needed.
 - **PROXY_CONTENT**: Proxy video content itself through your server (optional). Leave it as TRUE to avoid any CORS errors while fetching the stream.
 - **BACKEND_PORT**: Custom backend port for the server. Useful when running behind vpn (e.g. gluetun) and there is a port conflict. Leave unchanged otherwise.
+- **IMPERSONATE**: Browser TLS fingerprint used by `curl_cffi` for upstream requests (default `chrome136`). If streams start returning 403 again, try another profile (e.g. `chrome131`, `safari184`) without rebuilding.
 
 Edit the `.env` for docker compose.
 

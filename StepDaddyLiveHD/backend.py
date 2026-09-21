@@ -1,6 +1,7 @@
 import os
 import asyncio
 # import httpx
+from StepDaddyLiveHD import epg
 from StepDaddyLiveHD.step_daddy import StepDaddy, Channel
 from fastapi import Response, status, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
@@ -43,44 +44,29 @@ async def key(url: str, host: str):
 @fastapi_app.get("/content/{path}/{host}")
 async def content(path: str, host: str):
     try:
+        host = host.removesuffix(".ts")
         host = step_daddy.content_url(host)
         headers = step_daddy._headers(referer=host)
         
         async with step_daddy._session.stream(
                 "GET", step_daddy.content_url(path), headers=headers) as response:
             if response.status_code != 200:
-                return JSONResponse(
-                    content={
-                        "error": f"Upstream status code: {response.status_code}",
-                        "details": f"{response.text[:200]}"
-                    },
-                    status_code=response.status_code
-                )
+                if response.status_code in (403, 410):
+                    step_daddy.invalidate_cache()
+                return Response(status_code=response.status_code)
 
             async def proxy_stream():
                 async for chunk in response.aiter_content(chunk_size=1024*1024):
                     yield chunk
             return StreamingResponse(proxy_stream(), media_type="application/octet-stream")
     except curl_cffi.requests.exceptions.HTTPError as e:
-        # If we catch a specific httpx error, we can often extract the correct status code
-        # from the exception object itself.
         status_code = getattr(e.response, 'status_code',
                               status.HTTP_503_SERVICE_UNAVAILABLE)
-        return JSONResponse(
-            content={
-                "error": f"Failed to connect or stream from upstream source.",
-                "details": str(e)
-            },
-            status_code=status_code
-        )
-    except Exception as e:
-        return JSONResponse(
-            content={
-                "error": "An internal server error occurred during content proxying.",
-                "details": str(e)
-            },
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        if status_code in (403, 410):
+            step_daddy.invalidate_cache()
+        return Response(status_code=status_code)
+    except Exception:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 async def update_channels():
@@ -91,6 +77,17 @@ async def update_channels():
             await asyncio.sleep(random.randint(1700, 2000))
         except asyncio.CancelledError:
             continue
+
+
+async def update_epg():
+    while True:
+        try:
+            await asyncio.to_thread(epg.build_epg)
+            await asyncio.sleep(random.randint(43000, 44000))
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(600)
 
 
 def get_channels():
@@ -106,6 +103,20 @@ def get_channel(channel_id) -> Channel | None:
 @fastapi_app.get("/playlist.m3u8")
 def playlist():
     return Response(content=step_daddy.playlist(), media_type="application/vnd.apple.mpegurl", headers={"Content-Disposition": "attachment; filename=playlist.m3u8"})
+
+
+@fastapi_app.get("/epg.xml")
+def epg_xml():
+    if not os.path.exists(epg.EPG_XML_PATH):
+        return JSONResponse(content={"error": "EPG not generated yet"}, status_code=status.HTTP_404_NOT_FOUND)
+    return FileResponse(epg.EPG_XML_PATH, media_type="application/xml", filename="epg.xml")
+
+
+@fastapi_app.get("/epg.xml.gz")
+def epg_xml_gz():
+    if not os.path.exists(epg.EPG_GZ_PATH):
+        return JSONResponse(content={"error": "EPG not generated yet"}, status_code=status.HTTP_404_NOT_FOUND)
+    return FileResponse(epg.EPG_GZ_PATH, media_type="application/gzip", filename="epg.xml.gz")
 
 
 async def get_schedule():

@@ -39,7 +39,7 @@ COPY . .
 
 ARG PORT API_URL PROXY_CONTENT SOCKS5
 # Download other npm dependencies and compile frontend
-RUN REFLEX_API_URL=${API_URL:-http://localhost:$PORT} reflex export --loglevel debug --frontend-only --no-zip && mv .web/build/client/* /srv/ && rm -rf .web
+RUN REFLEX_API_URL=${API_URL:-http://10.0.0.216:$PORT} reflex export --loglevel debug --frontend-only --no-zip && mv .web/build/client/* /srv/ && rm -rf .web
 
 
 # Final image with only necessary files
@@ -49,7 +49,7 @@ FROM docker.io/python:3.13-slim
 RUN apt-get update -y && apt-get install -y caddy redis-server && rm -rf /var/lib/apt/lists/*
 
 ARG PORT API_URL
-ENV PATH="/app/.venv/bin:$PATH" PORT=$PORT REFLEX_API_URL=${API_URL:-http://localhost:$PORT} REDIS_URL=redis://localhost PYTHONUNBUFFERED=1 PROXY_CONTENT=${PROXY_CONTENT:-TRUE} SOCKS5=${SOCKS5:-""}
+ENV PATH="/app/.venv/bin:$PATH" PORT=$PORT REFLEX_API_URL=${API_URL:-http://10.0.0.216:$PORT} REDIS_URL=redis://10.0.0.216 PYTHONUNBUFFERED=1 PROXY_CONTENT=${PROXY_CONTENT:-TRUE} SOCKS5=${SOCKS5:-""}
 
 WORKDIR /app
 COPY --from=builder /app /app

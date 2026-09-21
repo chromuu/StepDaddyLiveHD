@@ -6,3 +6,5 @@ assets/external/
 .venv
 __pycache__/
 /.idea/
+epg-cache/
+logo-cache/

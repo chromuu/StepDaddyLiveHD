@@ -16,6 +16,7 @@ services:
       - PROXY_CONTENT=${PROXY_CONTENT}
       - SOCKS5=${SOCKS5}
       - BACKEND_PORT=${BACKEND_PORT}
+      - IMPERSONATE=${IMPERSONATE:-chrome136}
     ports:
       - "${PORT}:${PORT}"
     restart: always
@@ -23,6 +24,7 @@ services:
       - .env
     container_name: step-daddy-live-hd
     healthcheck:
-      test: curl -f http://127.0.0.1:3535/playlist || exit 1
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${PORT:-3535}/playlist.m3u8', timeout=5).status == 200 else 1)"]
       interval: 60s
       retries: 3
+      start_period: 120s

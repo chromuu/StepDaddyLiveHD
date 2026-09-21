@@ -77,3 +77,26 @@ def decode_bundle(response_text: str) -> dict:
         except Exception:
             continue
     return {}
+
+
+def _b64_text(value: str) -> str:
+    value = value.strip()
+    return base64.b64decode(value + "=" * (-len(value) % 4)).decode("utf-8")
+
+
+def decode_econfig(blob: str) -> dict:
+    """Decode the ``window._econfig`` blob from the embed page.
+
+    Mirrors the player JS: base64-decode, split into 4 equal chunks, drop the
+    4th character of each chunk, base64-decode each chunk, reorder them as
+    [2, 0, 3, 1], join, base64-decode once more and parse as JSON.
+    """
+    order = [2, 0, 3, 1]
+    outer = _b64_text(blob)
+    chunk_len = len(outer) // len(order)
+    parts = [None] * len(order)
+    for i, target in enumerate(order):
+        chunk = outer[i * chunk_len:(i + 1) * chunk_len]
+        chunk = chunk[:3] + chunk[4:]
+        parts[target] = _b64_text(chunk)
+    return json.loads(_b64_text("".join(parts)))
