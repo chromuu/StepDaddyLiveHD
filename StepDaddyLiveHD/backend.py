@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 # import httpx
 from StepDaddyLiveHD import epg
 from StepDaddyLiveHD.step_daddy import StepDaddy, Channel
@@ -9,6 +10,8 @@ from .utils import urlsafe_base64_decode
 from urllib.parse import quote, urlparse
 import random
 import curl_cffi.requests
+
+logger = logging.getLogger(__name__)
 
 fastapi_app = FastAPI()
 step_daddy = StepDaddy()
@@ -41,24 +44,94 @@ async def key(url: str, host: str):
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+# (connect timeout, read timeout): curl aborts a streamed request if the upstream
+# sends nothing for about the sum of both, instead of hanging the player forever.
+CONTENT_TIMEOUT = (4, 4)
+# How many times a segment that drops mid-download is resumed with a Range request.
+# Stalls (curl timeout) are not resumed: by then the player is better off retrying.
+CONTENT_RESUME_ATTEMPTS = 2
+CURL_TIMEOUT_CODE = 28
+
+
+async def _open_content(url: str, headers: dict, offset: int = 0):
+    if offset:
+        headers = {**headers, "Range": f"bytes={offset}-"}
+    return await step_daddy._session.request(
+        "GET", url, headers=headers, stream=True, timeout=CONTENT_TIMEOUT)
+
+
+async def _abort_content(response):
+    # Setting quit_now is synchronous, so the upstream download stops even when
+    # we are being cancelled (player disconnected) and can't await anything.
+    if response.quit_now:
+        response.quit_now.set()
+    await response.aclose()
+
+
+async def _proxy_content(response, url: str, headers: dict):
+    """Relay a segment for the whole lifetime of the response, resuming it if the
+    upstream connection drops part way, and closing the upstream when done."""
+    sent = 0
+    skip = 0
+    attempts = 0
+    try:
+        while True:
+            try:
+                async for chunk in response.aiter_content():
+                    if skip:
+                        if len(chunk) <= skip:
+                            skip -= len(chunk)
+                            continue
+                        chunk = chunk[skip:]
+                        skip = 0
+                    sent += len(chunk)
+                    yield chunk
+                return
+            except curl_cffi.requests.exceptions.RequestException as e:
+                if attempts >= CONTENT_RESUME_ATTEMPTS or e.code == CURL_TIMEOUT_CODE:
+                    logger.warning("Segment failed after %d bytes: %s", sent, e)
+                    # Re-raise so the connection is cut instead of ending a short
+                    # segment cleanly, and the player knows to refetch it.
+                    raise
+                attempts += 1
+                await _abort_content(response)
+                response = await _open_content(url, headers, offset=sent)
+                if response.status_code == 206:
+                    skip = 0
+                elif response.status_code == 200:
+                    skip = sent  # upstream ignored Range: drop what was already sent
+                else:
+                    raise
+    finally:
+        await _abort_content(response)
+
+
 @fastapi_app.get("/content/{path}/{host}")
 async def content(path: str, host: str):
     try:
         host = host.removesuffix(".ts")
         host = step_daddy.content_url(host)
         headers = step_daddy._headers(referer=host)
-        
-        async with step_daddy._session.stream(
-                "GET", step_daddy.content_url(path), headers=headers) as response:
-            if response.status_code != 200:
-                if response.status_code in (403, 410):
-                    step_daddy.invalidate_cache()
-                return Response(status_code=response.status_code)
+        url = step_daddy.content_url(path)
 
-            async def proxy_stream():
-                async for chunk in response.aiter_content(chunk_size=1024*1024):
-                    yield chunk
-            return StreamingResponse(proxy_stream(), media_type="application/octet-stream")
+        # Not `async with session.stream(...)`: leaving that block before the
+        # player has read the body either closes the upstream or (curl_cffi 0.15)
+        # waits for the whole segment to download before sending a single byte.
+        # The generator owns the upstream response and closes it when done.
+        response = await _open_content(url, headers)
+        if response.status_code != 200:
+            await _abort_content(response)
+            if response.status_code in (403, 410):
+                step_daddy.invalidate_cache()
+            return Response(status_code=response.status_code)
+
+        length = response.headers.get("Content-Length")
+        # Only forward the length when curl won't be decompressing the body.
+        forward_length = length and not response.headers.get("Content-Encoding")
+        return StreamingResponse(
+            _proxy_content(response, url, headers),
+            media_type="application/octet-stream",
+            headers={"Content-Length": length} if forward_length else None)
     except curl_cffi.requests.exceptions.HTTPError as e:
         status_code = getattr(e.response, 'status_code',
                               status.HTTP_503_SERVICE_UNAVAILABLE)
