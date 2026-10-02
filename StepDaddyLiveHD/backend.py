@@ -9,6 +9,9 @@ from .utils import urlsafe_base64_decode
 from urllib.parse import quote, urlparse
 import random
 import curl_cffi.requests
+import logging
+
+logger = logging.getLogger(__name__)
 
 fastapi_app = FastAPI()
 step_daddy = StepDaddy()
@@ -69,14 +72,29 @@ async def content(path: str, host: str):
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
+CHANNEL_RETRY_MIN = 30
+CHANNEL_RETRY_MAX = 1800
+
+
 async def update_channels():
+    # Must never die: on failure keep the last good list and retry with
+    # exponential backoff instead of letting the task exit for good.
+    retry_delay = CHANNEL_RETRY_MIN
     while True:
         try:
             # await step_daddy.resolve_base_url()
             await step_daddy.load_channels()
-            await asyncio.sleep(random.randint(1700, 2000))
+            retry_delay = CHANNEL_RETRY_MIN
+            delay = random.randint(1700, 2000)
         except asyncio.CancelledError:
-            continue
+            raise
+        except Exception as e:
+            delay = retry_delay
+            logger.warning(
+                f"Channel refresh failed ({type(e).__name__}: {e}); keeping "
+                f"{len(step_daddy.channels)} cached channels, retrying in {delay}s")
+            retry_delay = min(retry_delay * 2, CHANNEL_RETRY_MAX)
+        await asyncio.sleep(delay)
 
 
 async def update_epg():
@@ -103,6 +121,15 @@ def get_channel(channel_id) -> Channel | None:
 @fastapi_app.get("/playlist.m3u8")
 def playlist():
     return Response(content=step_daddy.playlist(), media_type="application/vnd.apple.mpegurl", headers={"Content-Disposition": "attachment; filename=playlist.m3u8"})
+
+
+@fastapi_app.get("/health")
+def health():
+    count = len(step_daddy.channels)
+    if count == 0:
+        return JSONResponse(content={"status": "no channels loaded", "channels": 0},
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    return {"status": "ok", "channels": count}
 
 
 @fastapi_app.get("/epg.xml")
