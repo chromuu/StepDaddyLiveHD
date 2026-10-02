@@ -17,6 +17,7 @@ services:
       - SOCKS5=${SOCKS5}
       - BACKEND_PORT=${BACKEND_PORT}
       - IMPERSONATE=${IMPERSONATE:-chrome136}
+      - URL_SECRET=${URL_SECRET:-}
     ports:
       - "${PORT}:${PORT}"
     restart: always
