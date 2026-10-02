@@ -8,8 +8,10 @@ from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from .utils import urlsafe_base64_decode
 from urllib.parse import quote, urlparse
 import random
+import logging
 import curl_cffi.requests
 
+logger = logging.getLogger(__name__)
 fastapi_app = FastAPI()
 step_daddy = StepDaddy()
 
@@ -47,23 +49,31 @@ async def content(path: str, host: str):
         host = host.removesuffix(".ts")
         host = step_daddy.content_url(host)
         headers = step_daddy._headers(referer=host)
-        
-        async with step_daddy._session.stream(
-                "GET", step_daddy.content_url(path), headers=headers) as response:
-            if response.status_code != 200:
-                if response.status_code in (403, 410):
-                    step_daddy.invalidate_cache()
-                return Response(status_code=response.status_code)
 
-            async def proxy_stream():
-                async for chunk in response.aiter_content(chunk_size=1024*1024):
+        # Not `async with session.stream(...)`: its exit awaits the whole
+        # download, so the segment was fully buffered before the first byte
+        # reached the player. Close the upstream once the body is relayed.
+        # In stream mode the timeout aborts a stalled transfer.
+        response = await step_daddy._session.request(
+            "GET", step_daddy.content_url(path), headers=headers, stream=True, timeout=15)
+        if response.status_code != 200:
+            await response.aclose()
+            if response.status_code in (403, 410):
+                step_daddy.invalidate_cache(host)
+            return Response(status_code=response.status_code)
+
+        async def proxy_stream():
+            try:
+                async for chunk in response.aiter_content():
                     yield chunk
-            return StreamingResponse(proxy_stream(), media_type="application/octet-stream")
+            finally:
+                await response.aclose()
+        return StreamingResponse(proxy_stream(), media_type="application/octet-stream")
     except curl_cffi.requests.exceptions.HTTPError as e:
         status_code = getattr(e.response, 'status_code',
                               status.HTTP_503_SERVICE_UNAVAILABLE)
         if status_code in (403, 410):
-            step_daddy.invalidate_cache()
+            step_daddy.invalidate_cache(host)
         return Response(status_code=status_code)
     except Exception:
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
@@ -76,7 +86,11 @@ async def update_channels():
             await step_daddy.load_channels()
             await asyncio.sleep(random.randint(1700, 2000))
         except asyncio.CancelledError:
-            continue
+            break
+        except Exception:
+            # A failed refresh must not end the loop; retry sooner.
+            logger.exception("Channel refresh failed, retrying in 60s")
+            await asyncio.sleep(60)
 
 
 async def update_epg():

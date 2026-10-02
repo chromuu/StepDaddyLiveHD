@@ -169,7 +169,7 @@ class StepDaddy:
         except (OSError, json.JSONDecodeError):
             self._epg_map = {}
         self._cache = {}  # channel_id -> resolved playlist info (see _resolve)
-        self._cache_invalidated_at = 0  # Cooldown timestamp for invalidation
+        self._invalidated_at = {}  # channel_id -> when its token was last invalidated
         # Cookies to be set by Flaresolverr first and used by curl_cffi subsequently
         self._cookies = {}
 
@@ -184,8 +184,8 @@ class StepDaddy:
 
     async def load_channels(self):
         channels = []
+        channels_url = f"{self._base_url}/24-7-channels.php"
         try:
-            channels_url = f"{self._base_url}/24-7-channels.php"
             response = await self._session.post(
                 url=channels_url,
                 headers=self._headers(),
@@ -217,8 +217,13 @@ class StepDaddy:
                     Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo,
                             tvg_id=self._epg_map.get(channel_name)))
         finally:
-            self.channels = sorted(channels, key=lambda channel: (
-                channel.name.startswith("18"), channel.name))
+            # Keep the last good list if this refresh failed or parsed nothing,
+            # otherwise one bad response empties the playlist.
+            if channels:
+                self.channels = sorted(channels, key=lambda channel: (
+                    channel.name.startswith("18"), channel.name))
+            else:
+                logger.warning(f"No channels parsed from {channels_url}, keeping {len(self.channels)} cached")
 
     async def _extract_stream_url(self, source_url: str) -> str:
         """Fetch the embed page and pull the signed m3u8 URL out of it.
@@ -309,6 +314,7 @@ class StepDaddy:
             "m3u8_playlist_url": m3u8_playlist_url,
             "m3u8_stream_info": m3u8_stream_info,
             "expiry": expiry,
+            "resolved_at": time.time(),
         }
 
     async def stream(self, channel_id: str):
@@ -316,7 +322,7 @@ class StepDaddy:
         if entry is None or int(time.time()) >= entry["expiry"]:
             logger.info(f"Cache miss for channel {channel_id}")
             self._cache.pop(channel_id, None)
-            since_invalidate = time.time() - self._cache_invalidated_at
+            since_invalidate = time.time() - self._invalidated_at.get(channel_id, 0)
             if since_invalidate < 120:
                 cooldown = random.uniform(1.0, 3.0)
                 logger.info(f"Cooling down {cooldown:.1f}s before CDN re-fetch")
@@ -364,23 +370,31 @@ class StepDaddy:
         logger.info(f"Content_Key_Url: {url}")
         key_headers = self._headers(referer=f"{host}")
 
-        key_response = await self._session.get(url, headers=key_headers)
+        key_response = await self._session.get(url, headers=key_headers, timeout=12)
         if key_response.status_code != 200:
-            raise Exception("Failed to get key")
+            if key_response.status_code in (403, 410):
+                self.invalidate_cache(host)
+            raise Exception(f"Failed to get key ({key_response.status_code})")
         return key_response.content
 
     @staticmethod
     def content_url(path: str):
         return decrypt(path)
 
-    def invalidate_cache(self):
+    def invalidate_cache(self, source_url: str):
+        """Drop the cached token of the channel whose embed page is source_url.
+
+        Only that channel re-resolves; other viewers are unaffected. A token
+        resolved under 60s ago is kept, since 403s for segments of the
+        previous token can still be in flight.
+        """
         now = time.time()
-        if now - self._cache_invalidated_at < 60:
-            return
-        if self._cache:
-            logger.info("Cache invalidated (token expired)")
-            self._cache.clear()
-            self._cache_invalidated_at = now
+        for channel_id, entry in list(self._cache.items()):
+            if entry["source_url"] != source_url or now - entry["resolved_at"] < 60:
+                continue
+            logger.info(f"Cache invalidated for channel {channel_id} (token expired)")
+            self._cache.pop(channel_id, None)
+            self._invalidated_at[channel_id] = now
 
     def playlist(self):
         data = f"#EXTM3U url-tvg=\"{config.api_url}/epg.xml\"\n"
