@@ -183,42 +183,53 @@ class StepDaddy:
 
 
     async def load_channels(self):
-        channels = []
-        try:
-            channels_url = f"{self._base_url}/24-7-channels.php"
-            response = await self._session.post(
-                url=channels_url,
-                headers=self._headers(),
-                cookies=self._cookies
-            )
-            # Logic to update self._base_url if it hase moved to a new domain
-            url_from_resp = urlparse(response.url)
-            extracted_base_url = f"{
-                url_from_resp.scheme}://{url_from_resp.netloc}"
-            if extracted_base_url != self._base_url:
-                logger.info(f"Updated baseUrl: {extracted_base_url}")
-                self._base_url = extracted_base_url
+        """Fetch the channel list and replace ``self.channels`` on success.
 
-            matches = re.findall(
-                r'<a class="card"\s+href="/watch\.php\?id=(\d+)"[^>]*>\s*<div class="card__title">(.*?)</div>',
-                # response,
-                response.text,
-                re.DOTALL
-            )
-            for channel_id, channel_name in matches:
-                channel_name = html.unescape(
-                    channel_name.strip()).replace("#", "")
-                meta = self._meta.get(
-                    "18+" if channel_name.startswith("18+") else channel_name, {})
-                logo = meta.get("logo", "")
-                if logo:
-                    logo = f"{config.api_url}/logo/{urlsafe_base64(logo)}"
-                channels.append(
-                    Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo,
-                            tvg_id=self._epg_map.get(channel_name)))
-        finally:
-            self.channels = sorted(channels, key=lambda channel: (
-                channel.name.startswith("18"), channel.name))
+        Raises on any failure (network error, bad status, no channels parsed)
+        and leaves the previous channel list in place, so a transient upstream
+        problem doesn't wipe the playlist.
+        """
+        channels = []
+        channels_url = f"{self._base_url}/24-7-channels.php"
+        response = await self._session.post(
+            url=channels_url,
+            headers=self._headers(),
+            cookies=self._cookies
+        )
+        # Logic to update self._base_url if it hase moved to a new domain
+        url_from_resp = urlparse(response.url)
+        extracted_base_url = f"{
+            url_from_resp.scheme}://{url_from_resp.netloc}"
+        if extracted_base_url != self._base_url:
+            logger.info(f"Updated baseUrl: {extracted_base_url}")
+            self._base_url = extracted_base_url
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Channel list returned HTTP {response.status_code}")
+
+        matches = re.findall(
+            r'<a class="card"\s+href="/watch\.php\?id=(\d+)"[^>]*>\s*<div class="card__title">(.*?)</div>',
+            # response,
+            response.text,
+            re.DOTALL
+        )
+        for channel_id, channel_name in matches:
+            channel_name = html.unescape(
+                channel_name.strip()).replace("#", "")
+            meta = self._meta.get(
+                "18+" if channel_name.startswith("18+") else channel_name, {})
+            logo = meta.get("logo", "")
+            if logo:
+                logo = f"{config.api_url}/logo/{urlsafe_base64(logo)}"
+            channels.append(
+                Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo,
+                        tvg_id=self._epg_map.get(channel_name)))
+        if not channels:
+            raise RuntimeError("Channel list page contained no channels")
+        self.channels = sorted(channels, key=lambda channel: (
+            channel.name.startswith("18"), channel.name))
+        logger.info(f"Loaded {len(self.channels)} channels")
 
     async def _extract_stream_url(self, source_url: str) -> str:
         """Fetch the embed page and pull the signed m3u8 URL out of it.
