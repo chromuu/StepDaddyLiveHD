@@ -21,6 +21,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Upstream statuses that mean the signed stream token has expired or been revoked.
+TOKEN_EXPIRED_STATUSES = (403, 410)
+# A fresh entry is not evicted again for this long, so late 403s from segments
+# or keys signed with the previous token don't throw away the new one.
+EVICT_GRACE_SECONDS = 20
+# Re-resolving a channel this soon after it was evicted is delayed slightly to
+# avoid hammering the CDN when a token keeps getting rejected.
+REFETCH_COOLDOWN_SECONDS = 120
+
+
+class UpstreamError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class Channel(BaseModel):
     id: str
     name: str
@@ -169,7 +185,9 @@ class StepDaddy:
         except (OSError, json.JSONDecodeError):
             self._epg_map = {}
         self._cache = {}  # channel_id -> resolved playlist info (see _resolve)
-        self._cache_invalidated_at = 0  # Cooldown timestamp for invalidation
+        self._evicted_at = {}  # channel_id -> when its token was last rejected
+        self._resolve_locks = {}  # channel_id -> lock so viewers share one resolve
+        self._prefetch_tasks = set()  # keeps background re-resolves referenced
         # Cookies to be set by Flaresolverr first and used by curl_cffi subsequently
         self._cookies = {}
 
@@ -183,42 +201,53 @@ class StepDaddy:
 
 
     async def load_channels(self):
-        channels = []
-        try:
-            channels_url = f"{self._base_url}/24-7-channels.php"
-            response = await self._session.post(
-                url=channels_url,
-                headers=self._headers(),
-                cookies=self._cookies
-            )
-            # Logic to update self._base_url if it hase moved to a new domain
-            url_from_resp = urlparse(response.url)
-            extracted_base_url = f"{
-                url_from_resp.scheme}://{url_from_resp.netloc}"
-            if extracted_base_url != self._base_url:
-                logger.info(f"Updated baseUrl: {extracted_base_url}")
-                self._base_url = extracted_base_url
+        """Fetch the channel list and replace ``self.channels`` on success.
 
-            matches = re.findall(
-                r'<a class="card"\s+href="/watch\.php\?id=(\d+)"[^>]*>\s*<div class="card__title">(.*?)</div>',
-                # response,
-                response.text,
-                re.DOTALL
-            )
-            for channel_id, channel_name in matches:
-                channel_name = html.unescape(
-                    channel_name.strip()).replace("#", "")
-                meta = self._meta.get(
-                    "18+" if channel_name.startswith("18+") else channel_name, {})
-                logo = meta.get("logo", "")
-                if logo:
-                    logo = f"{config.api_url}/logo/{urlsafe_base64(logo)}"
-                channels.append(
-                    Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo,
-                            tvg_id=self._epg_map.get(channel_name)))
-        finally:
-            self.channels = sorted(channels, key=lambda channel: (
-                channel.name.startswith("18"), channel.name))
+        Raises on any failure (network error, bad status, no channels parsed)
+        and leaves the previous channel list in place, so a transient upstream
+        problem doesn't wipe the playlist.
+        """
+        channels = []
+        channels_url = f"{self._base_url}/24-7-channels.php"
+        response = await self._session.post(
+            url=channels_url,
+            headers=self._headers(),
+            cookies=self._cookies
+        )
+        # Logic to update self._base_url if it hase moved to a new domain
+        url_from_resp = urlparse(response.url)
+        extracted_base_url = f"{
+            url_from_resp.scheme}://{url_from_resp.netloc}"
+        if extracted_base_url != self._base_url:
+            logger.info(f"Updated baseUrl: {extracted_base_url}")
+            self._base_url = extracted_base_url
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Channel list returned HTTP {response.status_code}")
+
+        matches = re.findall(
+            r'<a class="card"\s+href="/watch\.php\?id=(\d+)"[^>]*>\s*<div class="card__title">(.*?)</div>',
+            # response,
+            response.text,
+            re.DOTALL
+        )
+        for channel_id, channel_name in matches:
+            channel_name = html.unescape(
+                channel_name.strip()).replace("#", "")
+            meta = self._meta.get(
+                "18+" if channel_name.startswith("18+") else channel_name, {})
+            logo = meta.get("logo", "")
+            if logo:
+                logo = f"{config.api_url}/logo/{urlsafe_base64(logo)}"
+            channels.append(
+                Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo,
+                        tvg_id=self._epg_map.get(channel_name)))
+        if not channels:
+            raise RuntimeError("Channel list page contained no channels")
+        self.channels = sorted(channels, key=lambda channel: (
+            channel.name.startswith("18"), channel.name))
+        logger.info(f"Loaded {len(self.channels)} channels")
 
     async def _extract_stream_url(self, source_url: str) -> str:
         """Fetch the embed page and pull the signed m3u8 URL out of it.
@@ -309,34 +338,52 @@ class StepDaddy:
             "m3u8_playlist_url": m3u8_playlist_url,
             "m3u8_stream_info": m3u8_stream_info,
             "expiry": expiry,
+            "resolved_at": time.time(),
         }
 
-    async def stream(self, channel_id: str):
+    async def _get_entry(self, channel_id: str) -> dict:
+        """Return a valid cached entry for the channel, resolving it if needed."""
         entry = self._cache.get(channel_id)
-        if entry is None or int(time.time()) >= entry["expiry"]:
+        if entry is not None and int(time.time()) < entry["expiry"]:
+            return entry
+        lock = self._resolve_locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            # Another viewer may have resolved it while we waited for the lock.
+            entry = self._cache.get(channel_id)
+            if entry is not None and int(time.time()) < entry["expiry"]:
+                return entry
             logger.info(f"Cache miss for channel {channel_id}")
             self._cache.pop(channel_id, None)
-            since_invalidate = time.time() - self._cache_invalidated_at
-            if since_invalidate < 120:
+            since_evict = time.time() - self._evicted_at.get(channel_id, 0)
+            if since_evict < REFETCH_COOLDOWN_SECONDS:
                 cooldown = random.uniform(1.0, 3.0)
-                logger.info(f"Cooling down {cooldown:.1f}s before CDN re-fetch")
+                logger.info(f"Cooling down {cooldown:.1f}s before CDN re-fetch for channel {channel_id}")
                 await asyncio.sleep(cooldown)
             entry = await self._resolve(channel_id)
             self._cache[channel_id] = entry
+            return entry
 
-        source_url = entry["source_url"]
-        m3u8_playlist_url = entry["m3u8_playlist_url"]
-        m3u8_stream_info = entry["m3u8_stream_info"]
+    async def stream(self, channel_id: str):
+        # Try the cached token first; if the CDN rejects it, evict this channel
+        # only and retry once with a freshly resolved token. This is also what
+        # catches expiry when PROXY_CONTENT is off and segments bypass us.
+        for attempt in range(2):
+            entry = await self._get_entry(channel_id)
+            source_url = entry["source_url"]
+            m3u8_playlist_url = entry["m3u8_playlist_url"]
+            m3u8_stream_info = entry["m3u8_stream_info"]
 
-        m3u8_playlist_resp = await self._session.get(
-            url=m3u8_playlist_url,
-            headers=self._headers(source_url),
-            timeout=12
-        )
-        if m3u8_playlist_resp.status_code != 200 or not m3u8_playlist_resp.text.startswith("#EXTM3U"):
-            # Token most likely expired early; drop it so the next request re-resolves.
-            self._cache.pop(channel_id, None)
+            m3u8_playlist_resp = await self._session.get(
+                url=m3u8_playlist_url,
+                headers=self._headers(source_url),
+                timeout=12
+            )
+            if m3u8_playlist_resp.status_code == 200 and m3u8_playlist_resp.text.startswith("#EXTM3U"):
+                break
             logger.warning(f"Media playlist fetch failed ({m3u8_playlist_resp.status_code}) for channel {channel_id}")
+            # Token most likely expired early; drop it so the retry re-resolves.
+            self.invalidate_channel(channel_id, force=True)
+        else:
             raise IndexError("Media playlist unavailable")
 
         m3u8_data = ""
@@ -364,23 +411,59 @@ class StepDaddy:
         logger.info(f"Content_Key_Url: {url}")
         key_headers = self._headers(referer=f"{host}")
 
-        key_response = await self._session.get(url, headers=key_headers)
+        key_response = await self._session.get(url, headers=key_headers, timeout=12)
         if key_response.status_code != 200:
-            raise Exception("Failed to get key")
+            if key_response.status_code in TOKEN_EXPIRED_STATUSES:
+                # The key is signed with the same token as the playlist, so a
+                # rejected key means the channel's token is dead.
+                self.invalidate_source(host)
+            raise UpstreamError(key_response.status_code, f"Failed to get key ({key_response.status_code})")
         return key_response.content
+
+    async def _prefetch(self, channel_id: str):
+        try:
+            await self._get_entry(channel_id)
+        except Exception as e:
+            logger.warning(f"Background re-resolve failed for channel {channel_id}: {e}")
 
     @staticmethod
     def content_url(path: str):
         return decrypt(path)
 
-    def invalidate_cache(self):
-        now = time.time()
-        if now - self._cache_invalidated_at < 60:
-            return
-        if self._cache:
-            logger.info("Cache invalidated (token expired)")
-            self._cache.clear()
-            self._cache_invalidated_at = now
+    def invalidate_channel(self, channel_id: str, force: bool = False) -> bool:
+        """Drop one channel's cached token. Returns True if it was evicted.
+
+        Unless ``force`` is set, an entry resolved within the last
+        EVICT_GRACE_SECONDS is kept: in-flight requests still carrying the old
+        token keep failing for a moment after a re-resolve.
+        """
+        entry = self._cache.get(channel_id)
+        if entry is None:
+            return False
+        if not force and time.time() - entry.get("resolved_at", 0) < EVICT_GRACE_SECONDS:
+            return False
+        logger.info(f"Token expired for channel {channel_id}, evicting it from cache")
+        del self._cache[channel_id]
+        self._evicted_at[channel_id] = time.time()
+        return True
+
+    def invalidate_source(self, source_url: str) -> str | None:
+        """Evict the channel whose embed page is ``source_url``.
+
+        Segment and key URLs carry the channel's source_url rather than its id,
+        so this maps one back to the other. The channel is re-resolved in the
+        background so the player's next playlist reload doesn't wait for it.
+        Returns the evicted channel id.
+        """
+        for channel_id, entry in list(self._cache.items()):
+            if entry["source_url"] == source_url:
+                if not self.invalidate_channel(channel_id):
+                    return None
+                task = asyncio.create_task(self._prefetch(channel_id))
+                self._prefetch_tasks.add(task)
+                task.add_done_callback(self._prefetch_tasks.discard)
+                return channel_id
+        return None
 
     def playlist(self):
         data = f"#EXTM3U url-tvg=\"{config.api_url}/epg.xml\"\n"

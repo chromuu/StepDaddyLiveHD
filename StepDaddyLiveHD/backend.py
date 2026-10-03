@@ -3,7 +3,7 @@ import asyncio
 import logging
 # import httpx
 from StepDaddyLiveHD import epg
-from StepDaddyLiveHD.step_daddy import StepDaddy, Channel
+from StepDaddyLiveHD.step_daddy import StepDaddy, Channel, UpstreamError, TOKEN_EXPIRED_STATUSES
 from fastapi import Response, status, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from .utils import urlsafe_base64_decode
@@ -40,6 +40,8 @@ async def key(url: str, host: str):
             media_type="application/octet-stream",
             headers={"Content-Disposition": "attachment; filename=key"}
         )
+    except UpstreamError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=e.status_code)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -121,8 +123,8 @@ async def content(path: str, host: str):
         response = await _open_content(url, headers)
         if response.status_code != 200:
             await _abort_content(response)
-            if response.status_code in (403, 410):
-                step_daddy.invalidate_cache()
+            if response.status_code in TOKEN_EXPIRED_STATUSES:
+                step_daddy.invalidate_source(host)
             return Response(status_code=response.status_code)
 
         length = response.headers.get("Content-Length")
@@ -135,21 +137,36 @@ async def content(path: str, host: str):
     except curl_cffi.requests.exceptions.HTTPError as e:
         status_code = getattr(e.response, 'status_code',
                               status.HTTP_503_SERVICE_UNAVAILABLE)
-        if status_code in (403, 410):
-            step_daddy.invalidate_cache()
+        if status_code in TOKEN_EXPIRED_STATUSES:
+            step_daddy.invalidate_source(host)
         return Response(status_code=status_code)
     except Exception:
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
+CHANNEL_RETRY_MIN = 30
+CHANNEL_RETRY_MAX = 1800
+
+
 async def update_channels():
+    # Must never die: on failure keep the last good list and retry with
+    # exponential backoff instead of letting the task exit for good.
+    retry_delay = CHANNEL_RETRY_MIN
     while True:
         try:
             # await step_daddy.resolve_base_url()
             await step_daddy.load_channels()
-            await asyncio.sleep(random.randint(1700, 2000))
+            retry_delay = CHANNEL_RETRY_MIN
+            delay = random.randint(1700, 2000)
         except asyncio.CancelledError:
-            continue
+            raise
+        except Exception as e:
+            delay = retry_delay
+            logger.warning(
+                f"Channel refresh failed ({type(e).__name__}: {e}); keeping "
+                f"{len(step_daddy.channels)} cached channels, retrying in {delay}s")
+            retry_delay = min(retry_delay * 2, CHANNEL_RETRY_MAX)
+        await asyncio.sleep(delay)
 
 
 async def update_epg():
@@ -176,6 +193,15 @@ def get_channel(channel_id) -> Channel | None:
 @fastapi_app.get("/playlist.m3u8")
 def playlist():
     return Response(content=step_daddy.playlist(), media_type="application/vnd.apple.mpegurl", headers={"Content-Disposition": "attachment; filename=playlist.m3u8"})
+
+
+@fastapi_app.get("/health")
+def health():
+    count = len(step_daddy.channels)
+    if count == 0:
+        return JSONResponse(content={"status": "no channels loaded", "channels": 0},
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    return {"status": "ok", "channels": count}
 
 
 @fastapi_app.get("/epg.xml")
