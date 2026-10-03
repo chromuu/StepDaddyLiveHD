@@ -2,7 +2,7 @@ import os
 import asyncio
 # import httpx
 from StepDaddyLiveHD import epg
-from StepDaddyLiveHD.step_daddy import StepDaddy, Channel
+from StepDaddyLiveHD.step_daddy import StepDaddy, Channel, UpstreamError, TOKEN_EXPIRED_STATUSES
 from fastapi import Response, status, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from .utils import urlsafe_base64_decode
@@ -40,6 +40,8 @@ async def key(url: str, host: str):
             media_type="application/octet-stream",
             headers={"Content-Disposition": "attachment; filename=key"}
         )
+    except UpstreamError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=e.status_code)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -54,8 +56,8 @@ async def content(path: str, host: str):
         async with step_daddy._session.stream(
                 "GET", step_daddy.content_url(path), headers=headers) as response:
             if response.status_code != 200:
-                if response.status_code in (403, 410):
-                    step_daddy.invalidate_cache()
+                if response.status_code in TOKEN_EXPIRED_STATUSES:
+                    step_daddy.invalidate_source(host)
                 return Response(status_code=response.status_code)
 
             async def proxy_stream():
@@ -65,8 +67,8 @@ async def content(path: str, host: str):
     except curl_cffi.requests.exceptions.HTTPError as e:
         status_code = getattr(e.response, 'status_code',
                               status.HTTP_503_SERVICE_UNAVAILABLE)
-        if status_code in (403, 410):
-            step_daddy.invalidate_cache()
+        if status_code in TOKEN_EXPIRED_STATUSES:
+            step_daddy.invalidate_source(host)
         return Response(status_code=status_code)
     except Exception:
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)

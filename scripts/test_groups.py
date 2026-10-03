@@ -16,12 +16,14 @@ class Cfg:
     socks5 = ""
     api_url = "http://x:3535"
     proxy_content = True
+    impersonate = "chrome"
 fake_rxconfig.config = Cfg()
 sys.modules["rxconfig"] = fake_rxconfig
 
 fake_utils = types.ModuleType("StepDaddyLiveHD.utils")
 fu = fake_utils
 fu.encrypt = fu.decrypt = fu.urlsafe_base64 = lambda x: x
+fu.decode_econfig = lambda x: {}
 sys.modules["StepDaddyLiveHD.utils"] = fu
 
 from StepDaddyLiveHD.step_daddy import tags_to_group
