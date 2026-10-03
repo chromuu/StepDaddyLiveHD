@@ -8,3 +8,4 @@ __pycache__/
 /.idea/
 epg-cache/
 logo-cache/
+.url_key

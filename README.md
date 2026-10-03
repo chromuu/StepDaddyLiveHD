@@ -75,6 +75,7 @@ docker run -p 3535:3535 step-daddy-live-hd
 - **PROXY_CONTENT**: Proxy video content itself through your server (optional). Leave it as TRUE to avoid any CORS errors while fetching the stream. When it is FALSE, players fetch video segments straight from the CDN, so the server can't see a segment rejected for an expired token. Expiry is then caught when the player next reloads the channel's playlist (or its key), which the server re-resolves on the spot.
 - **BACKEND_PORT**: Custom backend port for the server. Useful when running behind vpn (e.g. gluetun) and there is a port conflict. Leave unchanged otherwise.
 - **IMPERSONATE**: Browser TLS fingerprint used by `curl_cffi` for upstream requests (default `chrome136`). If streams start returning 403 again, try another profile (e.g. `chrome131`, `safari184`) without rebuilding.
+- **URL_SECRET**: Any long random string. Keeps proxied stream links valid across redeploys, so players don't break when the container is recreated. If unset, a key is generated once and stored in `.url_key`, which survives restarts but not a recreated container.
 
 Edit the `.env` for docker compose.
 

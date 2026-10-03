@@ -3,3 +3,4 @@
 !.web/package.json
 .states
 .venv
+.url_key

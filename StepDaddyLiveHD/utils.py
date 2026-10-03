@@ -2,8 +2,53 @@ import os
 import re
 import base64
 import json
+import hashlib
+import tempfile
 
-key_bytes = os.urandom(64)
+KEY_FILE = os.environ.get("URL_KEY_FILE", ".url_key")
+
+
+def _load_key_bytes() -> bytes:
+    """Key that obscures upstream URLs inside /key and /content links.
+
+    It must be identical in every backend worker and survive restarts, or
+    players holding links issued earlier get undecryptable URLs. URL_SECRET
+    pins it explicitly; otherwise it is generated once and kept in KEY_FILE.
+    """
+    secret = os.environ.get("URL_SECRET", "")
+    if secret:
+        return hashlib.sha512(secret.encode()).digest()
+    try:
+        with open(KEY_FILE, "rb") as f:
+            key = f.read()
+        if len(key) == 64:
+            return key
+    except OSError:
+        pass
+    # Write to a temp file and link it into place: link fails if another
+    # worker won the race, and then everyone uses that worker's key.
+    key = os.urandom(64)
+    directory = os.path.dirname(os.path.abspath(KEY_FILE))
+    fd, tmp = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+        os.link(tmp, KEY_FILE)
+    except FileExistsError:
+        with open(KEY_FILE, "rb") as f:
+            existing = f.read()
+        if len(existing) == 64:
+            key = existing
+        else:  # corrupt or truncated: replace it
+            os.replace(tmp, KEY_FILE)
+            return key
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return key
+
+
+key_bytes = _load_key_bytes()
 
 
 def encrypt(input_string: str):
