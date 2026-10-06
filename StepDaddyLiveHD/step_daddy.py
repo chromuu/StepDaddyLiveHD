@@ -252,18 +252,28 @@ class StepDaddy:
     async def _extract_stream_url(self, source_url: str) -> str:
         """Fetch the embed page and pull the signed m3u8 URL out of it.
 
-        The embed page currently ships its config as ``window._econfig`` (see
-        ``decode_econfig``). The older ``window.atob("...")`` form is kept as a
-        fallback in case the provider flips back.
+        The embed page currently declares the playlist as ``const SRC = "..."``.
+        The ``window._econfig`` blob (see ``decode_econfig``) and the older
+        ``window.atob("...")`` form are kept as fallbacks in case the provider
+        flips back.
         """
+        # The embed host only serves the player when the request looks like an
+        # iframe load; a plain document fetch gets a 403 "only works when embedded".
+        headers = self._headers(f"{self._base_url}/")
+        headers.update({"Sec-Fetch-Dest": "iframe", "Sec-Fetch-Site": "cross-site"})
         source_resp = await self._session.get(
             url=source_url,
-            headers=self._headers(f"{self._base_url}/"),
+            headers=headers,
             timeout=12
         )
         if source_resp.status_code != 200:
             logger.warning(f"Embed page returned {source_resp.status_code} for {source_url}")
             raise IndexError(f"Embed page returned {source_resp.status_code}")
+
+        src = re.search(
+            r"\bconst\s+SRC\s*=\s*['\"](https?://[^'\"]+)['\"]", source_resp.text)
+        if src:
+            return src.group(1)
 
         econfig = re.search(
             r"window\._econfig\s*=\s*['\"]([^'\"]+)['\"]", source_resp.text)
