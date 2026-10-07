@@ -6,7 +6,7 @@ from StepDaddyLiveHD import epg
 from StepDaddyLiveHD.step_daddy import StepDaddy, Channel, UpstreamError, TOKEN_EXPIRED_STATUSES
 from fastapi import Response, status, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
-from .utils import urlsafe_base64_decode
+from .utils import urlsafe_base64_decode, unwrap_segment
 from urllib.parse import quote, urlparse
 import random
 import curl_cffi.requests
@@ -126,6 +126,18 @@ async def content(path: str, host: str):
             if response.status_code in TOKEN_EXPIRED_STATUSES:
                 step_daddy.invalidate_source(host)
             return Response(status_code=response.status_code)
+
+        # The CDN now disguises segments as images (TS packed into PNG pixels
+        # and the like). Those have to be downloaded whole and unwrapped before
+        # a player can use them; plain TS is still relayed as it streams in.
+        if response.headers.get("Content-Type", "").startswith("image/"):
+            body = b"".join([chunk async for chunk in _proxy_content(response, url, headers)])
+            try:
+                ts = await asyncio.to_thread(unwrap_segment, body)
+            except Exception as e:
+                logger.warning("Could not unwrap segment (%d bytes): %s", len(body), e)
+                return Response(status_code=status.HTTP_502_BAD_GATEWAY)
+            return Response(content=ts, media_type="video/mp2t")
 
         length = response.headers.get("Content-Length")
         # Only forward the length when curl won't be decompressing the body.
