@@ -2,8 +2,13 @@ import os
 import re
 import base64
 import json
+import gzip
 import hashlib
+import io
+import struct
 import tempfile
+
+from PIL import Image
 
 KEY_FILE = os.environ.get("URL_KEY_FILE", ".url_key")
 
@@ -145,3 +150,92 @@ def decode_econfig(blob: str) -> dict:
         chunk = chunk[:3] + chunk[4:]
         parts[target] = _b64_text(chunk)
     return json.loads(_b64_text("".join(parts)))
+
+
+TS_SYNC = 0x47
+TS_PACKET = 188
+TPIX = b"TIKTIKPX"
+TRAW = b"TIKTIKRAW"
+TSGZ = b"TIKTIKTSGZ"
+
+
+def _looks_like_ts(data: bytes, start: int = 0) -> bool:
+    return (len(data) > start + TS_PACKET and data[start] == TS_SYNC
+            and data[start + TS_PACKET] == TS_SYNC)
+
+
+def _webp_exif_ts(data: bytes) -> bytes | None:
+    if len(data) < 16 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    off = 12
+    while off + 8 <= len(data):
+        tag = data[off:off + 4]
+        (n,) = struct.unpack("<I", data[off + 4:off + 8])
+        off += 8
+        if off + n > len(data):
+            return None
+        if tag == b"EXIF":
+            chunk = data[off:off + n]
+            return chunk if _looks_like_ts(chunk) else None
+        off += n + (n & 1)
+    return None
+
+
+def _png_trailer_ts(data: bytes) -> bytes | None:
+    off = 8
+    while off + 8 <= len(data):
+        (n,) = struct.unpack(">I", data[off:off + 4])
+        if n > len(data) - off - 12:
+            return None
+        chunk_type = data[off + 4:off + 8]
+        off += 12 + n
+        if chunk_type == b"IEND":
+            return data[off:] if _looks_like_ts(data, off) else None
+    return None
+
+
+def _png_pixels_ts(data: bytes) -> bytes | None:
+    image = Image.open(io.BytesIO(data))
+    if image.mode not in ("RGB", "RGBA"):
+        return None
+    rgb = image.convert("RGB").tobytes()
+    if rgb[:8] != TPIX:
+        return None
+    (n,) = struct.unpack(">I", rgb[8:12])
+    gz = rgb[12:12 + n]
+    if n <= 0 or len(gz) < n or gz[:2] != b"\x1f\x8b":
+        return None
+    ts = gzip.decompress(gz)
+    return ts if ts and ts[0] == TS_SYNC else None
+
+
+def unwrap_segment(data: bytes) -> bytes:
+    """Recover the MPEG-TS payload from a segment the CDN disguises as an image.
+
+    Mirrors the embed player's ``unwrap()``: TS hidden in a WebP EXIF chunk,
+    appended after a PNG's IEND, packed into PNG pixels (``TIKTIKPX`` + length
+    + gzip), or after a ``TIKTIKRAW``/``TIKTIKTSGZ`` marker. Plain TS is
+    returned unchanged. Raises ValueError if no payload is found.
+    """
+    if _looks_like_ts(data):
+        return data
+    ts = _webp_exif_ts(data)
+    if ts:
+        return ts
+    if data[:2] == b"\x89P":
+        ts = _png_trailer_ts(data) or _png_pixels_ts(data)
+        if ts:
+            return ts
+        raise ValueError("TS payload not found in PNG")
+    i = data.find(TRAW)
+    if i != -1 and data[i + len(TRAW):i + len(TRAW) + 1] == bytes([TS_SYNC]):
+        return data[i + len(TRAW):]
+    i = data.find(TSGZ)
+    if i != -1:
+        return gzip.decompress(data[i + len(TSGZ):])
+    i = data.find(bytes([TS_SYNC]))
+    while i != -1:
+        if _looks_like_ts(data, i):
+            return data[i:]
+        i = data.find(bytes([TS_SYNC]), i + 1)
+    raise ValueError("TS payload not found")
